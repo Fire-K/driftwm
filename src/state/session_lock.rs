@@ -18,7 +18,6 @@ use smithay::{
             RegistrationToken,
             timer::{TimeoutAction, Timer},
         },
-        drm::control::crtc,
         wayland_protocols::ext::session_lock::v1::server::ext_session_lock_v1::ExtSessionLockV1,
     },
     wayland::session_lock::SessionLocker,
@@ -234,9 +233,9 @@ impl DriftWm {
 
     /// A CRTC's frame provenance no longer describes anything on a panel — it
     /// went dark, went away, or belongs to a session that no longer owns it.
-    pub fn forget_lock_frame(&mut self, crtc: crtc::Handle) {
-        self.lock_frame_queued.remove(&crtc);
-        self.lock_frame_on_screen.remove(&crtc);
+    pub fn forget_lock_frame(&mut self, key: super::CrtcKey) {
+        self.lock_frame_queued.remove(&key);
+        self.lock_frame_on_screen.remove(&key);
     }
 
     /// As [`Self::forget_lock_frame`], for every CRTC at once.
@@ -365,9 +364,9 @@ impl DriftWm {
 
         for output in awaiting_present.iter().cloned().collect::<Vec<_>>() {
             let crtc = self
-                .udev_device
-                .as_ref()
-                .and_then(|dev| dev.crtc_for_output(&output));
+                .udev_devices
+                .values()
+                .find_map(|dev| dev.crtc_for_output(&output));
             tracing::warn!(
                 "Session lock: '{}' presented no lock frame within {LOCK_CONFIRM_TIMEOUT:?}, \
                  blanking it (redraw_pending={}, frame_in_flight={}, vblank_timer={}, dpms_off={})",

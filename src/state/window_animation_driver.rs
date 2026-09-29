@@ -1001,12 +1001,12 @@ impl DriftWm {
         let Some(mut backend) = self.backend.take() else {
             return;
         };
-        if let Some(pixels) = crate::render::capture_close_pixels(
-            backend.renderer(),
-            surface,
-            geometry,
-            Instant::now(),
-        ) {
+        if let Some(pixels) = backend
+            .with_renderer(|r| {
+                crate::render::capture_close_pixels(r, surface, geometry, Instant::now())
+            })
+            .flatten()
+        {
             self.resize_captures.stash(id, pixels, chrome, generation);
         }
         self.backend = Some(backend);
@@ -1041,14 +1041,18 @@ impl DriftWm {
         let Some(mut backend) = self.backend.take() else {
             return;
         };
-        let crossfade = crate::render::resize_crossfade(
-            backend.renderer(),
-            &capture.pixels,
-            committed_size,
-            flatten_scale,
-            corner_clip.as_ref(),
-            capture.chrome,
-        );
+        let crossfade = backend
+            .with_renderer(|r| {
+                crate::render::resize_crossfade(
+                    r,
+                    &capture.pixels,
+                    committed_size,
+                    flatten_scale,
+                    corner_clip.as_ref(),
+                    capture.chrome,
+                )
+            })
+            .flatten();
         self.backend = Some(backend);
         match crossfade {
             Some(crossfade) => {
@@ -1205,12 +1209,16 @@ impl DriftWm {
         };
         let id = surface.id();
         if !self.close_pixels.contains_key(&id)
-            && let Some(px) = crate::render::capture_close_pixels(
-                backend.renderer(),
-                surface,
-                window.geometry(),
-                Instant::now(),
-            )
+            && let Some(px) = backend
+                .with_renderer(|r| {
+                    crate::render::capture_close_pixels(
+                        r,
+                        surface,
+                        window.geometry(),
+                        Instant::now(),
+                    )
+                })
+                .flatten()
         {
             self.close_pixels.insert(id.clone(), px);
         }
@@ -1310,19 +1318,23 @@ impl DriftWm {
         let chrome = chrome.as_ref();
         let snapshot = if let Some(output) = fullscreen_output {
             let flatten_scale = output.current_scale().fractional_scale();
-            crate::render::snapshot_screen(
-                backend.renderer(),
-                &px,
-                output.name(),
-                Point::from((
-                    fullscreen_centre.x - geom_loc.x,
-                    fullscreen_centre.y - geom_loc.y,
-                )),
-                flatten_scale,
-                scale_amplitude,
-                alpha_only,
-                chrome,
-            )
+            backend
+                .with_renderer(|r| {
+                    crate::render::snapshot_screen(
+                        r,
+                        &px,
+                        output.name(),
+                        Point::from((
+                            fullscreen_centre.x - geom_loc.x,
+                            fullscreen_centre.y - geom_loc.y,
+                        )),
+                        flatten_scale,
+                        scale_amplitude,
+                        alpha_only,
+                        chrome,
+                    )
+                })
+                .flatten()
         } else if let Some(site) = self.stage.pin_of(window).cloned() {
             let flatten_scale = self
                 .output_by_name(&site.output)
@@ -1332,16 +1344,20 @@ impl DriftWm {
                 site.screen_pos.x - geom_loc.x,
                 site.screen_pos.y - geom_loc.y,
             ));
-            crate::render::snapshot_screen(
-                backend.renderer(),
-                &px,
-                site.output,
-                screen_origin,
-                flatten_scale,
-                scale_amplitude,
-                alpha_only,
-                chrome,
-            )
+            backend
+                .with_renderer(|r| {
+                    crate::render::snapshot_screen(
+                        r,
+                        &px,
+                        site.output,
+                        screen_origin,
+                        flatten_scale,
+                        scale_amplitude,
+                        alpha_only,
+                        chrome,
+                    )
+                })
+                .flatten()
         } else {
             let stage_pos = self.stage.position_of(window).unwrap_or_default();
             let window_origin = Point::from((
@@ -1350,15 +1366,19 @@ impl DriftWm {
             ));
             let flatten_scale =
                 self.flatten_scale_for_canvas_rect(Rectangle::new(stage_pos, geom_size));
-            crate::render::snapshot_canvas(
-                backend.renderer(),
-                &px,
-                window_origin,
-                flatten_scale,
-                scale_amplitude,
-                alpha_only,
-                chrome,
-            )
+            backend
+                .with_renderer(|r| {
+                    crate::render::snapshot_canvas(
+                        r,
+                        &px,
+                        window_origin,
+                        flatten_scale,
+                        scale_amplitude,
+                        alpha_only,
+                        chrome,
+                    )
+                })
+                .flatten()
         };
         self.backend = Some(backend);
         if let Some(snapshot) = snapshot {

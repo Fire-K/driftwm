@@ -22,6 +22,8 @@ use driftwm::stage::ElementId;
 
 use crate::state::SuspendedWindow;
 
+use super::bridge::GlesBridge;
+use super::renderer::DriftRenderer;
 use super::{
     OutputRenderElements, TrimmedElement, WindowRenderAnimation, WindowTransformElement,
     painted_rect, shaders,
@@ -324,13 +326,13 @@ impl ResizeCrossfade {
     /// interpolated visual rect exactly as the live content does. `opacity` is
     /// the opacity the window is drawn at — the fade starts from the density
     /// the old picture actually had, not from full.
-    pub fn render_element(
+    pub fn render_element<R: DriftRenderer>(
         &self,
         loc: Point<f64, Physical>,
         size: Size<i32, Logical>,
         animation: Option<WindowRenderAnimation>,
         opacity: f64,
-    ) -> OutputRenderElements {
+    ) -> OutputRenderElements<R> {
         let texture = TextureRenderElement::from_texture_buffer(
             loc,
             &self.buffer,
@@ -344,7 +346,10 @@ impl ResizeCrossfade {
             None => (Point::default(), Point::default(), Scale::from(1.0)),
         };
         OutputRenderElements::ClosingWindow(WindowTransformElement::new(
-            texture, origin, offset, scale,
+            GlesBridge(texture),
+            origin,
+            offset,
+            scale,
         ))
     }
 }
@@ -772,13 +777,13 @@ pub(crate) fn snapshot_screen(
 impl ClosingSnapshot {
     /// The render element for this snapshot on `output`, or `None` if it does
     /// not belong there.
-    fn render_element(
+    fn render_element<R: DriftRenderer>(
         &self,
         output_name: &str,
         camera: Point<f64, Logical>,
         zoom: f64,
         output_scale: f64,
-    ) -> Option<OutputRenderElements> {
+    ) -> Option<OutputRenderElements<R>> {
         let alpha = fade_out_alpha(self.progress);
         let close_scale = if self.alpha_only {
             1.0
@@ -823,7 +828,7 @@ impl ClosingSnapshot {
         );
         Some(OutputRenderElements::ClosingWindow(
             WindowTransformElement::new(
-                texture,
+                GlesBridge(texture),
                 center,
                 Point::default(),
                 Scale::from(close_scale),
@@ -833,14 +838,14 @@ impl ClosingSnapshot {
 }
 
 /// Elements for every closing snapshot visible on `output`, top-most first.
-pub(crate) fn render_snapshots_for_output(
+pub(crate) fn render_snapshots_for_output<R: DriftRenderer>(
     snapshots: &[ClosingSnapshot],
     output_name: &str,
     visible: Rectangle<i32, Logical>,
     camera: Point<f64, Logical>,
     zoom: f64,
     output_scale: f64,
-) -> Vec<OutputRenderElements> {
+) -> Vec<OutputRenderElements<R>> {
     snapshots
         .iter()
         .filter(|s| {

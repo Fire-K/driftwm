@@ -1,10 +1,11 @@
 use smithay::backend::allocator::Fourcc;
-use smithay::backend::renderer::gles::GlesRenderer;
+use smithay::backend::renderer::element::RenderElement;
 use smithay::output::Output;
 use smithay::reexports::wayland_server::Resource;
 use smithay::utils::{Physical, Rectangle, Scale, Size, Transform};
 
 use super::OutputRenderElements;
+use super::renderer::DriftRenderer;
 
 /// Get or create persistent capture state for an output+protocol pair.
 fn get_capture_state<'a>(
@@ -53,14 +54,38 @@ fn stamp_capture_submit(
 }
 
 /// Fulfill pending screencopy requests by rendering to offscreen textures.
-pub fn render_screencopy(
+/// Promote waiting capture sessions the way the `render_*` functions below do,
+/// then report whether any capture is pending for `output` or a toplevel. Lets
+/// the cross-GPU path skip its extra primary-GPU recompose when nobody captures.
+pub fn capture_work_pending(state: &mut crate::state::DriftWm, output: &Output) -> bool {
+    let timestamp = state.start_time.elapsed();
+    let min_interval = capture_min_interval(state.config.backend.max_capture_fps);
+    state.image_copy_capture_state.promote_waiting_frames(
+        output,
+        &mut state.pending_captures,
+        timestamp,
+        min_interval,
+    );
+    state
+        .image_copy_capture_state
+        .promote_waiting_toplevel_frames(&mut state.pending_captures, timestamp, min_interval);
+    !state.pending_captures.is_empty()
+        || state
+            .pending_screencopies
+            .iter()
+            .any(|sc| sc.output() == output)
+}
+
+pub fn render_screencopy<R: DriftRenderer>(
     state: &mut crate::state::DriftWm,
-    renderer: &mut GlesRenderer,
+    renderer: &mut R,
     output: &Output,
-    elements: &[OutputRenderElements],
-) {
+    elements: &[OutputRenderElements<R>],
+) where
+    OutputRenderElements<R>: RenderElement<R>,
+{
     use driftwm::protocols::screencopy::ScreencopyBuffer;
-    use smithay::backend::renderer::{ExportMem, Renderer};
+
     use smithay::wayland::shm;
     use std::ptr;
 
@@ -108,7 +133,7 @@ pub fn render_screencopy(
     for screencopy in pending {
         let size = screencopy.buffer_size();
         let paint_cursors = screencopy.overlay_cursor();
-        let use_elements: Vec<&OutputRenderElements> = if paint_cursors {
+        let use_elements: Vec<&OutputRenderElements<R>> = if paint_cursors {
             elements.iter().collect()
         } else {
             elements
@@ -203,16 +228,9 @@ pub fn render_screencopy(
                     cs,
                 );
                 match result {
-                    Ok(mapping) => {
+                    Ok(bytes) => {
                         let copy_ok =
                             shm::with_buffer_contents_mut(wl_buffer, |shm_buf, shm_len, _data| {
-                                let bytes = match renderer.map_texture(&mapping) {
-                                    Ok(b) => b,
-                                    Err(e) => {
-                                        tracing::warn!("screencopy: map_texture failed: {e:?}");
-                                        return false;
-                                    }
-                                };
                                 let copy_len = shm_len.min(bytes.len());
                                 unsafe {
                                     ptr::copy_nonoverlapping(
@@ -221,11 +239,10 @@ pub fn render_screencopy(
                                         copy_len,
                                     );
                                 }
-                                true
                             });
 
                         match copy_ok {
-                            Ok(true) => {
+                            Ok(()) => {
                                 stamp_capture_submit(
                                     &mut state.render.capture_state,
                                     &capture_key,
@@ -283,23 +300,30 @@ fn clear_color_for(format: Fourcc, opaque: bool) -> [f32; 4] {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn render_to_offscreen(
-    renderer: &mut GlesRenderer,
+fn render_to_offscreen<R: DriftRenderer>(
+    renderer: &mut R,
     size: smithay::utils::Size<i32, Physical>,
     scale: Scale<f64>,
     transform: Transform,
     format: Fourcc,
     opaque_clear: bool,
-    elements: &[&OutputRenderElements],
+    elements: &[&OutputRenderElements<R>],
     capture_state: Option<&mut crate::state::CaptureOutputState>,
-) -> Result<smithay::backend::renderer::gles::GlesMapping, Box<dyn std::error::Error>> {
+) -> Result<Vec<u8>, Box<dyn std::error::Error>>
+where
+    OutputRenderElements<R>: RenderElement<R>,
+{
+    use smithay::backend::renderer::Offscreen;
     use smithay::backend::renderer::damage::OutputDamageTracker;
     use smithay::backend::renderer::gles::GlesTexture;
-    use smithay::backend::renderer::{Bind, ExportMem, Offscreen};
 
     let buffer_size = size.to_logical(1).to_buffer(1, Transform::Normal);
     let clear = clear_color_for(format, opaque_clear);
 
+    // Bind, render AND read back all through R: on a cross-GPU MultiRenderer,
+    // Offscreen/Bind allocate the texture on the scanout GPU, so a readback via
+    // the primary GlesRenderer would bind it on the wrong GL context.
+    // R's ExportMem routes copy_framebuffer/map_texture to the owning GPU.
     if let Some(cs) = capture_state {
         // Reuse or reallocate texture when size changes
         let tex = match &mut cs.offscreen_texture {
@@ -314,30 +338,24 @@ fn render_to_offscreen(
             }
         };
 
-        {
-            let mut target = renderer.bind(tex)?;
-            let _ =
-                cs.damage_tracker
-                    .render_output(renderer, &mut target, cs.age, elements, clear)?;
-        }
+        let mut target = renderer.bind(tex)?;
+        let _ = cs
+            .damage_tracker
+            .render_output(renderer, &mut target, cs.age, elements, clear)?;
         cs.age += 1;
 
-        let target = renderer.bind(tex)?;
         let mapping =
             renderer.copy_framebuffer(&target, Rectangle::from_size(buffer_size), format)?;
-        Ok(mapping)
+        Ok(renderer.map_texture(&mapping)?.to_vec())
     } else {
         let mut texture: GlesTexture =
             Offscreen::<GlesTexture>::create_buffer(renderer, format, buffer_size)?;
-        {
-            let mut target = renderer.bind(&mut texture)?;
-            let mut damage_tracker = OutputDamageTracker::new(size, scale, transform);
-            let _ = damage_tracker.render_output(renderer, &mut target, 0, elements, clear)?;
-        }
-        let target = renderer.bind(&mut texture)?;
+        let mut target = renderer.bind(&mut texture)?;
+        let mut damage_tracker = OutputDamageTracker::new(size, scale, transform);
+        let _ = damage_tracker.render_output(renderer, &mut target, 0, elements, clear)?;
         let mapping =
             renderer.copy_framebuffer(&target, Rectangle::from_size(buffer_size), format)?;
-        Ok(mapping)
+        Ok(renderer.map_texture(&mapping)?.to_vec())
     }
 }
 
@@ -346,15 +364,16 @@ fn render_to_offscreen(
 /// `scale` matches the scale the elements were composed at. `Abgr8888` puts
 /// bytes in R,G,B,A order with a transparent clear, so content lands on a
 /// transparent canvas.
-pub(crate) fn render_elements_to_rgba(
-    renderer: &mut GlesRenderer,
+pub(crate) fn render_elements_to_rgba<R: DriftRenderer>(
+    renderer: &mut R,
     size: Size<i32, Physical>,
     scale: Scale<f64>,
-    elements: &[&OutputRenderElements],
-) -> Result<Vec<u8>, String> {
-    use smithay::backend::renderer::ExportMem;
-
-    let mapping = render_to_offscreen(
+    elements: &[&OutputRenderElements<R>],
+) -> Result<Vec<u8>, String>
+where
+    OutputRenderElements<R>: RenderElement<R>,
+{
+    render_to_offscreen(
         renderer,
         size,
         scale,
@@ -364,11 +383,7 @@ pub(crate) fn render_elements_to_rgba(
         elements,
         None,
     )
-    .map_err(|e| format!("offscreen render failed: {e:?}"))?;
-    let bytes = renderer
-        .map_texture(&mapping)
-        .map_err(|e| format!("map_texture failed: {e:?}"))?;
-    Ok(bytes.to_vec())
+    .map_err(|e| format!("offscreen render failed: {e:?}"))
 }
 
 /// Render elements directly into a client-provided DMA-BUF (zero CPU copies).
@@ -380,18 +395,20 @@ pub(crate) fn render_elements_to_rgba(
 ///
 /// When `capture_state` is provided, reuses the damage tracker for incremental rendering.
 #[allow(clippy::too_many_arguments)]
-fn render_to_dmabuf(
-    renderer: &mut GlesRenderer,
+fn render_to_dmabuf<R: DriftRenderer>(
+    renderer: &mut R,
     dmabuf: &mut smithay::backend::allocator::dmabuf::Dmabuf,
     size: Size<i32, Physical>,
     scale: Scale<f64>,
     transform: Transform,
     opaque_clear: bool,
-    elements: &[&OutputRenderElements],
+    elements: &[&OutputRenderElements<R>],
     capture_state: Option<&mut crate::state::CaptureOutputState>,
-) -> Result<smithay::backend::renderer::sync::SyncPoint, Box<dyn std::error::Error>> {
+) -> Result<smithay::backend::renderer::sync::SyncPoint, Box<dyn std::error::Error>>
+where
+    OutputRenderElements<R>: RenderElement<R>,
+{
     use smithay::backend::allocator::Buffer;
-    use smithay::backend::renderer::Bind;
     use smithay::backend::renderer::damage::OutputDamageTracker;
 
     let clear = clear_color_for(dmabuf.format().code, opaque_clear);
@@ -418,13 +435,14 @@ fn render_to_dmabuf(
 }
 
 /// Fulfill pending ext-image-copy-capture frames by rendering to offscreen textures.
-pub fn render_capture_frames(
+pub fn render_capture_frames<R: DriftRenderer>(
     state: &mut crate::state::DriftWm,
-    renderer: &mut GlesRenderer,
+    renderer: &mut R,
     output: &Output,
-    elements: &[OutputRenderElements],
-) {
-    use smithay::backend::renderer::{ExportMem, Renderer};
+    elements: &[OutputRenderElements<R>],
+) where
+    OutputRenderElements<R>: RenderElement<R>,
+{
     use smithay::wayland::shm;
     use std::ptr;
 
@@ -470,7 +488,7 @@ pub fn render_capture_frames(
 
     for capture in pending {
         let paint_cursors = capture.paint_cursors;
-        let use_elements: Vec<&OutputRenderElements> = if paint_cursors {
+        let use_elements: Vec<&OutputRenderElements<R>> = if paint_cursors {
             elements.iter().collect()
         } else {
             elements
@@ -559,22 +577,14 @@ pub fn render_capture_frames(
                 cs,
             );
             match result {
-                Ok(mapping) => {
+                Ok(bytes) => {
                     shm::with_buffer_contents_mut(&capture.buffer, |shm_buf, shm_len, _data| {
-                        let bytes = match renderer.map_texture(&mapping) {
-                            Ok(b) => b,
-                            Err(e) => {
-                                tracing::warn!("capture: map_texture failed: {e:?}");
-                                return false;
-                            }
-                        };
                         let copy_len = shm_len.min(bytes.len());
                         unsafe {
                             ptr::copy_nonoverlapping(bytes.as_ptr(), shm_buf.cast(), copy_len);
                         }
-                        true
                     })
-                    .unwrap_or(false)
+                    .is_ok()
                 }
                 Err(e) => {
                     tracing::warn!("capture: offscreen render failed: {e:?}");
@@ -621,12 +631,17 @@ pub fn render_capture_frames(
 /// compositing the cursor onto a window-relative buffer requires intersecting
 /// the cursor position against the captured window's geometry, which isn't
 /// wired in yet. Per-window screencast clients typically don't request it.
-pub fn render_toplevel_captures(state: &mut crate::state::DriftWm, renderer: &mut GlesRenderer) {
+pub fn render_toplevel_captures<R: DriftRenderer>(
+    state: &mut crate::state::DriftWm,
+    renderer: &mut R,
+) where
+    OutputRenderElements<R>: RenderElement<R>,
+{
     use driftwm::protocols::image_copy_capture::PendingCaptureKind;
+
     use smithay::backend::renderer::element::Kind;
     use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
     use smithay::backend::renderer::element::surface::render_elements_from_surface_tree;
-    use smithay::backend::renderer::{ExportMem, Renderer};
     use smithay::utils::Point;
     use smithay::wayland::shm;
     use std::ptr;
@@ -687,15 +702,19 @@ pub fn render_toplevel_captures(state: &mut crate::state::DriftWm, renderer: &mu
             .and_then(|r| r.opacity)
             .unwrap_or(1.0) as f32;
 
-        let surface_elems = render_elements_from_surface_tree::<
-            _,
-            WaylandSurfaceRenderElement<GlesRenderer>,
-        >(renderer, surface, origin, scale, opacity, Kind::Unspecified);
+        let surface_elems = render_elements_from_surface_tree::<_, WaylandSurfaceRenderElement<R>>(
+            renderer,
+            surface,
+            origin,
+            scale,
+            opacity,
+            Kind::Unspecified,
+        );
 
         // Walk popups attached to this surface (xdg dropdown menus,
         // tooltips, autocomplete). They aren't part of the toplevel's
         // subsurface tree — without this, captures miss any open menu.
-        let mut popup_elems: Vec<WaylandSurfaceRenderElement<GlesRenderer>> = Vec::new();
+        let mut popup_elems: Vec<WaylandSurfaceRenderElement<R>> = Vec::new();
         for (popup, popup_offset) in smithay::desktop::PopupManager::popups_for_surface(surface) {
             // Popup's geometry origin in capture-buffer space is `popup_offset`
             // (popup is positioned relative to the parent's geometry origin,
@@ -709,7 +728,7 @@ pub fn render_toplevel_captures(state: &mut crate::state::DriftWm, renderer: &mu
             .to_physical_precise_round(scale);
             popup_elems.extend(render_elements_from_surface_tree::<
                 _,
-                WaylandSurfaceRenderElement<GlesRenderer>,
+                WaylandSurfaceRenderElement<R>,
             >(
                 renderer,
                 popup.wl_surface(),
@@ -723,12 +742,12 @@ pub fn render_toplevel_captures(state: &mut crate::state::DriftWm, renderer: &mu
         // Wrap in OutputRenderElements (the Layer variant is a plain
         // WaylandSurfaceRenderElement passthrough). Popups go FIRST so
         // they sit above the surface tree in smithay's z-order.
-        let elems: Vec<OutputRenderElements> = popup_elems
+        let elems: Vec<OutputRenderElements<R>> = popup_elems
             .into_iter()
             .chain(surface_elems)
             .map(OutputRenderElements::Layer)
             .collect();
-        let elems_refs: Vec<&OutputRenderElements> = elems.iter().collect();
+        let elems_refs: Vec<&OutputRenderElements<R>> = elems.iter().collect();
 
         // Cache key derived from the captured surface — keeps GlesTexture +
         // damage tracker alive across frames instead of reallocating per frame.
@@ -781,22 +800,14 @@ pub fn render_toplevel_captures(state: &mut crate::state::DriftWm, renderer: &mu
                 &elems_refs,
                 cs,
             ) {
-                Ok(mapping) => {
+                Ok(bytes) => {
                     shm::with_buffer_contents_mut(&capture.buffer, |shm_buf, shm_len, _data| {
-                        let bytes = match renderer.map_texture(&mapping) {
-                            Ok(b) => b,
-                            Err(e) => {
-                                tracing::warn!("toplevel capture: map_texture failed: {e:?}");
-                                return false;
-                            }
-                        };
                         let copy_len = shm_len.min(bytes.len());
                         unsafe {
                             ptr::copy_nonoverlapping(bytes.as_ptr(), shm_buf.cast(), copy_len);
                         }
-                        true
                     })
-                    .unwrap_or(false)
+                    .is_ok()
                 }
                 Err(e) => {
                     tracing::warn!("toplevel capture: offscreen render failed: {e:?}");

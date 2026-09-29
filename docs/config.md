@@ -1164,9 +1164,9 @@ path to xwayland-satellite binary ($PATH lookup works)
 
 ## `[backend]`
 
-### `wait_for_frame_completion`
+### `render_gpu`
 
-Default: `false`
+Default: `"auto"`
 
 Hardware stability quirks. All default to false (opt-in). Enable these if you experience flickering, crashes, or rendering issues. Particularly useful on NVIDIA GPUs with proprietary drivers. Note: These flags must be set before launching driftwm. Changing them requires a restart. For additional NVIDIA-specific settings, set these environment variables in your session wrapper script or shell profile before starting driftwm:
 
@@ -1177,6 +1177,20 @@ export __GL_VRR_ALLOWED=0
 export __GL_MaxFramesAllowed=1
 export NVD_BACKEND=direct
 ```
+
+Multi-GPU (hybrid laptops: integrated + discrete). Restart required. Frames are always composited on ONE GPU (render_gpu); monitors wired to any other GPU show a copy of that frame. The discrete GPU is only woken while one of its monitors is plugged in, so an unused NVIDIA/AMD card can power down.
+
+Which GPU composites: "auto" (boot GPU, normally the integrated one), "integrated", "discrete", or an absolute node path like "/dev/dri/card1". An unavailable choice falls back to auto with a log line.
+
+### `gpus`
+
+Default: `"all"`
+
+"all": drive monitors on every GPU (external monitor on the discrete GPU's HDMI works). "render": drive only the render GPU's monitors and never open the others — use for integrated-only or discrete-only.
+
+### `wait_for_frame_completion`
+
+Default: `false`
 
 Force GPU-fence wait before every page flip (already done automatically when smithay reports needs_sync — typical case on NVIDIA. Set true only if you still see flicker after defaults.)
 

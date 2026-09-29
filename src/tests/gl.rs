@@ -93,7 +93,7 @@ pub fn install(f: &mut Fixture, mut renderer: GlesRenderer) {
     state.render.shadow_shader = shadow;
     state.render.border_shader = border;
     state.render.corner_clip_shader = corner_clip;
-    state.backend = Some(Backend::Udev(Box::new(renderer)));
+    state.backend = Some(Backend::Headless(Box::new(renderer)));
 }
 
 /// Drop the renderer before the fixture's teardown baseline check. A live

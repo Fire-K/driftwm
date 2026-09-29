@@ -983,7 +983,7 @@ impl Config {
         };
 
         let effects = parse_effects_config(raw.effects, &mut errors);
-        let backend = parse_backend_config(raw.backend);
+        let backend = parse_backend_config(raw.backend, &mut errors);
 
         let trackpad_speed = non_negative(
             raw.navigation.trackpad_speed.unwrap_or(1.5),

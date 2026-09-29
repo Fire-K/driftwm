@@ -124,6 +124,12 @@ use smithay::wayland::seat::WaylandFocus;
 use smithay::reexports::calloop::RegistrationToken;
 use smithay::reexports::drm::control::crtc;
 
+/// A CRTC on one DRM device. CRTC handles are only unique within a device, so
+/// per-CRTC frame bookkeeping is keyed by the device's KMS node as well —
+/// otherwise two GPUs whose CRTCs share a handle value would clear each other's
+/// in-flight state on every VBlank.
+pub type CrtcKey = (smithay::backend::drm::DrmNode, crtc::Handle);
+
 use crate::backend::Backend;
 use crate::input::gestures::GestureState;
 use crate::input::keyboard::TapTracker;
@@ -962,23 +968,23 @@ pub struct DriftWm {
     /// Outputs whose CRTC is currently active. Universe for [`Self::mark_all_dirty`].
     pub active_outputs: HashSet<Output>,
     pub redraws_needed: HashSet<Output>,
-    pub frames_pending: HashSet<crtc::Handle>,
+    pub frames_pending: HashSet<CrtcKey>,
     /// One-shot timers armed when queue_frame returned EmptyFrame so the loop
     /// still wakes at ~refresh rate to advance animations (e.g. xcursor frames).
-    pub estimated_vblank_timers: HashMap<crtc::Handle, RegistrationToken>,
-    /// Consecutive render-fence timeouts per CRTC, driving the udev backend's
+    pub estimated_vblank_timers: HashMap<CrtcKey, RegistrationToken>,
+    /// Consecutive render-fence timeouts per CRTC (see [`CrtcKey`]), driving the udev backend's
     /// escalating wait budget. Per-CRTC because one wedged output among several
     /// must not have its budget reset by its healthy neighbours in the same
     /// render pass. No entry is a fence that came back on its last frame.
-    pub fence_failures: HashMap<crtc::Handle, u32>,
+    pub fence_failures: HashMap<CrtcKey, u32>,
     /// Backstop for a lock confirmation that never gets its frames presented —
     /// see `LOCK_CONFIRM_TIMEOUT`.
     pub lock_confirm_timer: Option<RegistrationToken>,
     /// CRTCs whose in-flight (queued, not yet flipped) frame was composed as a
     /// lock frame.
-    pub lock_frame_queued: HashSet<crtc::Handle>,
+    pub lock_frame_queued: HashSet<CrtcKey>,
     /// CRTCs whose currently scanned-out frame was composed as a lock frame.
-    pub lock_frame_on_screen: HashSet<crtc::Handle>,
+    pub lock_frame_on_screen: HashSet<CrtcKey>,
 
     pub config_file_mtime: Option<std::time::SystemTime>,
 
@@ -1031,10 +1037,11 @@ pub struct DriftWm {
 
     pub satellite: Option<crate::xwayland::Satellite>,
 
-    /// Udev backend handle (Rc — cloneable). Single owner here; render loop
-    /// and protocols (gamma_control) borrow via `udev_device.as_ref()`.
-    /// `None` when the winit backend is in use.
-    pub udev_device: Option<crate::backend::udev::UdevDevice>,
+    /// Udev backend devices, keyed by their KMS (primary) DRM node. Each value
+    /// is an `Rc`-cloneable handle so the render loop and protocols
+    /// (gamma_control) can borrow independently of `DriftWm`. Empty when the
+    /// winit backend is in use; one entry per GPU we drive.
+    pub udev_devices: HashMap<smithay::backend::drm::DrmNode, crate::backend::udev::UdevDevice>,
 
     pub last_titlebar_click: Option<(
         Instant,

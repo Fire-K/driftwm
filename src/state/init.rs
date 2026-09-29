@@ -419,7 +419,7 @@ impl DriftWm {
             output_config_dirty: false,
             pending_mode_changes: HashMap::new(),
             satellite: None,
-            udev_device: None,
+            udev_devices: HashMap::new(),
             last_titlebar_click: None,
             hot_corner_latch: None,
             pending_click_navigate: None,

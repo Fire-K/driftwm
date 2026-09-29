@@ -1032,3 +1032,42 @@ fn toml_decoration_opacity_above_one_clamps_with_a_warning() {
         "an out-of-range opacity should clamp with a warning, got {warnings:?}"
     );
 }
+
+#[test]
+fn backend_gpu_selection_defaults_to_auto_and_all() {
+    use driftwm::config::{GpuScope, RenderGpu};
+    let config = Config::from_toml("").unwrap();
+    assert_eq!(config.backend.render_gpu, RenderGpu::Auto);
+    assert_eq!(config.backend.gpus, GpuScope::All);
+}
+
+#[test]
+fn backend_gpu_selection_parses_every_form() {
+    use driftwm::config::{GpuScope, RenderGpu};
+    let cases = [
+        ("integrated", RenderGpu::Integrated),
+        ("discrete", RenderGpu::Discrete),
+        ("auto", RenderGpu::Auto),
+        (
+            "/dev/dri/card1",
+            RenderGpu::Path("/dev/dri/card1".to_string()),
+        ),
+    ];
+    for (value, expected) in cases {
+        let toml = format!("[backend]\nrender_gpu = \"{value}\"\ngpus = \"render\"\n");
+        let (config, warnings) = Config::from_toml_collect(&toml).unwrap();
+        assert_eq!(config.backend.render_gpu, expected, "{value}");
+        assert_eq!(config.backend.gpus, GpuScope::RenderOnly);
+        assert!(warnings.is_empty(), "{value}: {warnings:?}");
+    }
+}
+
+#[test]
+fn backend_gpu_selection_rejects_unknown_values_with_a_warning() {
+    use driftwm::config::{GpuScope, RenderGpu};
+    let (config, warnings) =
+        Config::from_toml_collect("[backend]\nrender_gpu = \"nvidia\"\ngpus = \"both\"\n").unwrap();
+    assert_eq!(config.backend.render_gpu, RenderGpu::Auto);
+    assert_eq!(config.backend.gpus, GpuScope::All);
+    assert_eq!(warnings.len(), 2, "{warnings:?}");
+}

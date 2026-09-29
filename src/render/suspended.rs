@@ -12,13 +12,14 @@ use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::element::memory::{
     MemoryRenderBuffer, MemoryRenderBufferRenderElement,
 };
-use smithay::backend::renderer::gles::{GlesPixelProgram, GlesRenderer};
+use smithay::backend::renderer::gles::GlesPixelProgram;
 use smithay::utils::{Logical, Physical, Point, Rectangle, Scale, Size, Transform};
 
 use driftwm::config::DecorationConfig;
 
 use crate::decorations::{DecorationKey, WindowDecoration};
 use crate::render::elements::OutputRenderElements;
+use crate::render::renderer::DriftRenderer;
 use crate::render::shaders::{outer_corner_radius, push_border_element, push_shadow_element};
 use crate::render::{PixelSnapRescaleElement, TrimmedElement, painted_size};
 use crate::state::{BorderCacheEntry, ShadowCacheEntry, SuspendedWindow};
@@ -123,12 +124,12 @@ pub(crate) fn ensure_body(
 /// Push one stand-in chrome buffer, wrapped in the fade transform when the
 /// caller supplied one (a dismiss shrinks; the adoption crossfade passes `None`
 /// so its elements stay exactly what they were).
-fn push_chrome<E>(
-    target: &mut Vec<OutputRenderElements>,
+fn push_chrome<R: DriftRenderer, E>(
+    target: &mut Vec<OutputRenderElements<R>>,
     elem: PixelSnapRescaleElement<E>,
     animation: Option<super::WindowRenderAnimation>,
 ) where
-    OutputRenderElements: From<PixelSnapRescaleElement<E>>
+    OutputRenderElements<R>: From<PixelSnapRescaleElement<E>>
         + From<super::WindowTransformElement<PixelSnapRescaleElement<E>>>,
 {
     match animation {
@@ -142,8 +143,8 @@ fn push_chrome<E>(
 /// non-widget canvas bucket). Takes the chrome caches as disjoint borrows so
 /// the caller can keep the stage iterator alive.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn push_suspended_element(
-    renderer: &mut GlesRenderer,
+pub(super) fn push_suspended_element<R: DriftRenderer>(
+    renderer: &mut R,
     s: &Rc<SuspendedWindow>,
     loc: Point<i32, Logical>,
     focused: bool,
@@ -160,7 +161,7 @@ pub(super) fn push_suspended_element(
     camera: Point<f64, Logical>,
     zoom: f64,
     scale: Scale<f64>,
-    target: &mut Vec<OutputRenderElements>,
+    target: &mut Vec<OutputRenderElements<R>>,
 ) {
     let key = DecorationKey::Suspended(s.id);
     let size = s.size.get();

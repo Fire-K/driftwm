@@ -15,8 +15,8 @@ use super::toml::{
 };
 use super::types::{
     BackendConfig, DecorationConfig, DecorationMode, EffectsConfig, FocusPlacement, FontWeight,
-    HotCorners, ModKey, OutputConfig, OutputMode, OutputOutlineSettings, OutputPosition, PassList,
-    Pattern, TitleAlign, WindowRule,
+    GpuScope, HotCorners, ModKey, OutputConfig, OutputMode, OutputOutlineSettings, OutputPosition,
+    PassList, Pattern, RenderGpu, TitleAlign, WindowRule,
 };
 
 /// How actionable a config warning is. The error bar has room for one message,
@@ -535,8 +535,37 @@ pub(super) fn parse_effects_config(raw: EffectsFileConfig, errors: &mut Warnings
     }
 }
 
-pub(super) fn parse_backend_config(raw: BackendFileConfig) -> BackendConfig {
+pub(super) fn parse_backend_config(raw: BackendFileConfig, errors: &mut Warnings) -> BackendConfig {
+    let render_gpu = match raw.render_gpu.as_deref().map(str::trim) {
+        None | Some("auto") | Some("") => RenderGpu::Auto,
+        Some("integrated") => RenderGpu::Integrated,
+        Some("discrete") => RenderGpu::Discrete,
+        Some(path) if path.starts_with('/') => RenderGpu::Path(path.to_string()),
+        Some(other) => {
+            collect_warn(
+                errors,
+                format!(
+                    "config: [backend] render_gpu \"{other}\" is not auto, integrated, \
+                     discrete or an absolute /dev/dri/cardN path, using auto"
+                ),
+            );
+            RenderGpu::Auto
+        }
+    };
+    let gpus = match raw.gpus.as_deref().map(str::trim) {
+        None | Some("all") | Some("") => GpuScope::All,
+        Some("render") => GpuScope::RenderOnly,
+        Some(other) => {
+            collect_warn(
+                errors,
+                format!("config: [backend] gpus \"{other}\" is not all or render, using all"),
+            );
+            GpuScope::All
+        }
+    };
     BackendConfig {
+        render_gpu,
+        gpus,
         wait_for_frame_completion: raw.wait_for_frame_completion.unwrap_or(false),
         disable_direct_scanout: raw.disable_direct_scanout.unwrap_or(false),
         disable_hardware_cursor: raw.disable_hardware_cursor.unwrap_or(false),

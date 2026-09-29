@@ -1024,8 +1024,34 @@ pub fn effective_decoration_mode<'a>(
     rule_decoration.unwrap_or(default_mode)
 }
 
+/// Which GPU composites frames on the udev backend.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum RenderGpu {
+    /// The system's boot GPU, falling back to any GPU that works.
+    #[default]
+    Auto,
+    Integrated,
+    Discrete,
+    /// A DRM node path such as `/dev/dri/card1`.
+    Path(String),
+}
+
+/// Which GPUs' monitors the udev backend drives.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum GpuScope {
+    /// Every GPU with a connected monitor; secondary GPUs scan out frames
+    /// composited on the render GPU.
+    #[default]
+    All,
+    /// Only the render GPU. Other GPUs are never opened, so an idle discrete
+    /// GPU stays fully powered down (its monitors stay dark).
+    RenderOnly,
+}
+
 #[derive(Clone, Debug, PartialEq, Default)]
 pub struct BackendConfig {
+    pub render_gpu: RenderGpu,
+    pub gpus: GpuScope,
     pub wait_for_frame_completion: bool,
     pub disable_direct_scanout: bool,
     pub disable_hardware_cursor: bool,

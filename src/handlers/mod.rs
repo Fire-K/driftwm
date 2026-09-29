@@ -220,7 +220,10 @@ impl DmabufHandler for DriftWm {
             notifier.failed();
             return;
         };
-        if backend.renderer().import_dmabuf(&dmabuf, None).is_ok() {
+        if backend
+            .with_renderer(|r| r.import_dmabuf(&dmabuf, None))
+            .is_some_and(|res| res.is_ok())
+        {
             let _ = notifier.successful::<DriftWm>();
         } else {
             notifier.failed();
@@ -960,7 +963,12 @@ impl OutputManagementHandler for DriftWm {
     }
 
     fn apply_output_config(&mut self, configs: Vec<RequestedHeadConfig>) -> bool {
-        let is_udev = matches!(self.backend, Some(crate::backend::Backend::Udev(_)));
+        let is_udev = match self.backend {
+            Some(crate::backend::Backend::Udev(_)) => true,
+            #[cfg(test)]
+            Some(crate::backend::Backend::Headless(_)) => true,
+            _ => false,
+        };
 
         // Phase 1: validate everything and stage results. wlr-output-management
         // Apply is supposed to be all-or-nothing — if any head fails, we
@@ -1422,7 +1430,9 @@ impl GammaControlHandler for DriftWm {
     }
 
     fn get_gamma_size(&mut self, output: &smithay::output::Output) -> Option<u32> {
-        self.udev_device.as_ref()?.get_gamma_size(output)
+        self.udev_devices
+            .values()
+            .find_map(|d| d.get_gamma_size(output))
     }
 
     fn set_gamma(
@@ -1430,7 +1440,9 @@ impl GammaControlHandler for DriftWm {
         output: &smithay::output::Output,
         ramp: Option<Vec<u16>>,
     ) -> Option<()> {
-        self.udev_device.as_ref()?.set_gamma(output, ramp)
+        self.udev_devices
+            .values()
+            .find_map(|d| d.set_gamma(output, ramp.clone()))
     }
 }
 

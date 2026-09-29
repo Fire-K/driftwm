@@ -1,7 +1,7 @@
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::element::texture::TextureRenderElement;
 use smithay::backend::renderer::element::utils::{Relocate, RelocateRenderElement};
-use smithay::backend::renderer::element::{Element, Id, Kind};
+use smithay::backend::renderer::element::{Element, Id, Kind, RenderElement};
 use smithay::backend::renderer::gles::{
     GlesError, GlesRenderer, GlesTexProgram, GlesTexture, Uniform, UniformName, UniformType,
 };
@@ -13,6 +13,8 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use super::OutputRenderElements;
+use super::bridge::GlesBridge;
+use super::renderer::DriftRenderer;
 
 static BLUR_DOWN_SRC: &str = include_str!("../shaders/blur_down.glsl");
 static BLUR_UP_SRC: &str = include_str!("../shaders/blur_up.glsl");
@@ -103,7 +105,9 @@ fn backdrop_fingerprint<'a>(
 /// captures. Commit counters, not element `Id`s alone: a wallpaper daemon draws
 /// every new frame into one long-lived surface, so its `Id` never changes and
 /// an Id-only comparison leaves the frost frozen over it.
-fn background_signature(elements: &[OutputRenderElements]) -> Vec<(Id, CommitCounter)> {
+fn background_signature<R: DriftRenderer>(
+    elements: &[OutputRenderElements<R>],
+) -> Vec<(Id, CommitCounter)> {
     elements
         .iter()
         .map(|e| (e.id().clone(), e.current_commit()))
@@ -987,8 +991,8 @@ pub(crate) struct BlurRequestData {
 
 /// Commit counters of the elements a mask is rendered from: the signal for
 /// whether the client has painted since the mask was captured.
-fn surface_commits(
-    elements: &[OutputRenderElements],
+fn surface_commits<R: DriftRenderer>(
+    elements: &[OutputRenderElements<R>],
     (start, end): (usize, usize),
 ) -> impl Iterator<Item = CommitCounter> + '_ {
     elements[start..end].iter().map(|e| e.current_commit())
@@ -1012,14 +1016,14 @@ fn mask_region_complement(
 /// Process blur requests: for each blurred window, render behind-content to FBO,
 /// crop the window region, run Kawase blur passes, and insert the result.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn process_blur_requests(
+pub(crate) fn process_blur_requests<R: DriftRenderer>(
     state: &mut crate::state::DriftWm,
-    renderer: &mut GlesRenderer,
+    renderer: &mut R,
     output: &Output,
     output_scale: f64,
     camera: Point<f64, Logical>,
     zoom: f64,
-    all_elements: &mut Vec<OutputRenderElements>,
+    all_elements: &mut Vec<OutputRenderElements<R>>,
     blur_requests: &[BlurRequestData],
     overlay_prefix: usize,
     top_prefix: usize,
@@ -1027,10 +1031,23 @@ pub(crate) fn process_blur_requests(
     normal_prefix: usize,
     widget_prefix: usize,
     background_start: usize,
-) {
+) where
+    OutputRenderElements<R>: RenderElement<R>,
+{
     use smithay::backend::renderer::Color32F;
     use smithay::backend::renderer::damage::OutputDamageTracker;
     use smithay::backend::renderer::{Bind, Frame, Offscreen, Renderer};
+
+    // The blur pipeline mixes frame-renderer binds with raw GLES passes on the
+    // primary GPU's context. On a cross-GPU output those are two different GL
+    // contexts that can't share textures — render such frames without blur.
+    if state.render.frame_is_cross_gpu {
+        static CROSS_GPU_BLUR: std::sync::Once = std::sync::Once::new();
+        CROSS_GPU_BLUR.call_once(|| {
+            tracing::info!("blur is unavailable on outputs driven by a secondary GPU");
+        });
+        return;
+    }
 
     let logical_size = crate::state::output_logical_size(output);
     let output_size: Size<i32, Physical> = logical_size.to_physical_precise_round(output_scale);
@@ -1042,7 +1059,7 @@ pub(crate) fn process_blur_requests(
         None => *state
             .render
             .blur_wrap_mode
-            .insert(backdrop_wrap_mode(renderer)),
+            .insert(backdrop_wrap_mode(renderer.as_gles_renderer())),
     };
 
     let down_shader = state.render.blur_down_shader.clone().unwrap();
@@ -1050,7 +1067,7 @@ pub(crate) fn process_blur_requests(
     let blur_passes = state.config.effects.blur_radius as usize;
     // Shared by the taps and the pad, so the two cannot disagree on the scale.
     let blur_offset = state.config.effects.blur_strength as f32 * output_scale as f32;
-    let context_id = renderer.context_id();
+    let context_id = renderer.as_gles_renderer().context_id();
     let output_name = output.name();
     let geom_gen = state.render.blur_geometry_generation;
     let view = ViewStamp { camera, zoom };
@@ -1190,12 +1207,12 @@ pub(crate) fn process_blur_requests(
         if pays && (shared.stale || shared.textures.is_none()) && shared.backoff.ready() {
             if shared.textures.is_none() {
                 let a = Offscreen::<GlesTexture>::create_buffer(
-                    renderer,
+                    renderer.as_gles_renderer(),
                     Fourcc::Abgr8888,
                     out_buf_size,
                 );
                 let b = Offscreen::<GlesTexture>::create_buffer(
-                    renderer,
+                    renderer.as_gles_renderer(),
                     Fourcc::Abgr8888,
                     out_buf_size,
                 );
@@ -1203,8 +1220,8 @@ pub(crate) fn process_blur_requests(
                     // The Kawase passes sample past these edges at every mip; an
                     // NPOT texture left at the GL default REPEAT is incomplete on
                     // GLES 2 and samples black everywhere.
-                    set_wrap_mode(renderer, &a, wrap);
-                    set_wrap_mode(renderer, &b, wrap);
+                    set_wrap_mode(renderer.as_gles_renderer(), &a, wrap);
+                    set_wrap_mode(renderer.as_gles_renderer(), &b, wrap);
                     shared.textures = Some((a, b));
                 }
             }
@@ -1226,7 +1243,7 @@ pub(crate) fn process_blur_requests(
                     }
                     let blurred = rendered
                         && render_blur(
-                            renderer,
+                            renderer.as_gles_renderer(),
                             &down_shader,
                             &up_shader,
                             tex_a,
@@ -1284,7 +1301,7 @@ pub(crate) fn process_blur_requests(
         let key = (output_name.clone(), req.surface_id.clone());
         if !state.render.blur_cache.contains_key(&key) {
             let alloc = quantized_alloc(win_size, Size::default());
-            if let Some(c) = BlurCache::new(renderer, alloc, wrap) {
+            if let Some(c) = BlurCache::new(renderer.as_gles_renderer(), alloc, wrap) {
                 state.render.blur_cache.insert(key.clone(), c);
             } else {
                 tracing::debug!(
@@ -1300,7 +1317,7 @@ pub(crate) fn process_blur_requests(
         let cache = state.render.blur_cache.get_mut(&key).unwrap();
         let alloc = quantized_alloc(win_size, cache.alloc);
         if cache.alloc != alloc {
-            cache.resize(renderer, alloc, wrap);
+            cache.resize(renderer.as_gles_renderer(), alloc, wrap);
         }
         // Reset by the per-window path below on the frames that take it.
         cache.age_pads(PAD_KEEP_FRAMES);
@@ -1387,14 +1404,15 @@ pub(crate) fn process_blur_requests(
             // Already blurred full-screen, so edges see real neighbours and
             // no padding is needed.
             let shared_src = tex_a.clone();
-            let Ok(mut target) = renderer.bind(&mut cache.texture) else {
+            let gles = renderer.as_gles_renderer();
+            let Ok(mut target) = gles.bind(&mut cache.texture) else {
                 tracing::debug!(
                     surface = %req.surface_id,
                     "frost left unrendered: cannot bind the frost texture for the shared slice"
                 );
                 continue;
             };
-            let Ok(mut frame) = renderer.render(&mut target, win_size, Transform::Normal) else {
+            let Ok(mut frame) = gles.render(&mut target, win_size, Transform::Normal) else {
                 tracing::debug!(
                     surface = %req.surface_id,
                     "frost left unrendered: cannot draw into the frost texture for the shared slice"
@@ -1449,7 +1467,7 @@ pub(crate) fn process_blur_requests(
         // size, and the per-window offset rules out the shared-depth reuse an
         // output-sized capture allowed — so trim the slice to the elements that
         // can actually land in this capture before wrapping them.
-        let relocated: Vec<RelocateRenderElement<&OutputRenderElements>> = all_elements
+        let relocated: Vec<RelocateRenderElement<&OutputRenderElements<R>>> = all_elements
             [backdrop_starts[i]..]
             .iter()
             .filter(|e| e.geometry(elem_scale).overlaps(capture.clipped))
@@ -1482,7 +1500,7 @@ pub(crate) fn process_blur_requests(
                 output = %output_name,
                 "frost zeroed: nothing is drawn beneath this surface to capture"
             );
-            zero_texture(renderer, &cache.texture, cache.alloc);
+            zero_texture(renderer.as_gles_renderer(), &cache.texture, cache.alloc);
             // Settling has to take the commit signal with it, or the warm-up
             // re-dirties this frost every frame the scene stays empty beneath.
             cache.mask_commits = surface_commits(all_elements, surface_ranges[i]).collect();
@@ -1494,7 +1512,7 @@ pub(crate) fn process_blur_requests(
             continue;
         }
 
-        if !cache.ensure_pads(renderer, pad_live, wrap) {
+        if !cache.ensure_pads(renderer.as_gles_renderer(), pad_live, wrap) {
             tracing::debug!(
                 surface = %req.surface_id,
                 ?pad_live,
@@ -1549,9 +1567,12 @@ pub(crate) fn process_blur_requests(
                 .blur_scratch
                 .entry(output_name.clone())
                 .or_default();
-            let Some(mut scratch) =
-                pool.acquire(renderer, capture.clipped.size, wrap, scratch_budget)
-            else {
+            let Some(mut scratch) = pool.acquire(
+                renderer.as_gles_renderer(),
+                capture.clipped.size,
+                wrap,
+                scratch_budget,
+            ) else {
                 tracing::debug!(
                     surface = %req.surface_id,
                     size = ?capture.clipped.size,
@@ -1587,10 +1608,11 @@ pub(crate) fn process_blur_requests(
                 }
             }
 
-            let Ok(mut target) = renderer.bind(&mut *pad_a) else {
+            let gles = renderer.as_gles_renderer();
+            let Ok(mut target) = gles.bind(&mut *pad_a) else {
                 continue;
             };
-            let Ok(mut frame) = renderer.render(&mut target, pad_live, Transform::Normal) else {
+            let Ok(mut frame) = gles.render(&mut target, pad_live, Transform::Normal) else {
                 continue;
             };
             let _ = frame.clear(Color32F::TRANSPARENT, &[Rectangle::from_size(pad_live)]);
@@ -1615,7 +1637,7 @@ pub(crate) fn process_blur_requests(
 
         // Run Kawase blur passes on the padded crop
         if render_blur(
-            renderer,
+            renderer.as_gles_renderer(),
             &down_shader,
             &up_shader,
             pad_a,
@@ -1636,14 +1658,15 @@ pub(crate) fn process_blur_requests(
         // cache.texture, discarding the padding ring and its edge artifacts.
         {
             let blurred = pad_a.clone();
-            let Ok(mut target) = renderer.bind(&mut cache.texture) else {
+            let gles = renderer.as_gles_renderer();
+            let Ok(mut target) = gles.bind(&mut cache.texture) else {
                 tracing::debug!(
                     surface = %req.surface_id,
                     "frost left unrendered: cannot bind the frost texture for the crop"
                 );
                 continue;
             };
-            let Ok(mut frame) = renderer.render(&mut target, win_size, Transform::Normal) else {
+            let Ok(mut frame) = gles.render(&mut target, win_size, Transform::Normal) else {
                 tracing::debug!(
                     surface = %req.surface_id,
                     "frost left unrendered: cannot draw into the frost texture for the crop"
@@ -1725,7 +1748,7 @@ pub(crate) fn process_blur_requests(
             // the off-screen strip — the crop read that buffer's mirror wrap,
             // and nothing re-captured the mask once the pan settled.
             // (index_shift is 0 here — element insertion hasn't happened yet)
-            let relocated: Vec<RelocateRenderElement<&OutputRenderElements>> = all_elements
+            let relocated: Vec<RelocateRenderElement<&OutputRenderElements<R>>> = all_elements
                 [surf_start..surf_end]
                 .iter()
                 .map(|e| {
@@ -1781,11 +1804,11 @@ pub(crate) fn process_blur_requests(
             // pixels unfrosted.
             let outside = mask_region_complement(win_size, regions);
             if !outside.is_empty() {
-                let Ok(mut target) = renderer.bind(&mut cache.mask) else {
+                let gles = renderer.as_gles_renderer();
+                let Ok(mut target) = gles.bind(&mut cache.mask) else {
                     continue;
                 };
-                let Ok(mut frame) = renderer.render(&mut target, win_size, Transform::Normal)
-                else {
+                let Ok(mut frame) = gles.render(&mut target, win_size, Transform::Normal) else {
                     continue;
                 };
                 let _ = frame.clear(Color32F::TRANSPARENT, &outside);
@@ -1815,10 +1838,11 @@ pub(crate) fn process_blur_requests(
         {
             use smithay::backend::renderer::gles::ffi;
             let mask_src = cache.mask.clone();
-            let Ok(mut target) = renderer.bind(&mut cache.texture) else {
+            let gles = renderer.as_gles_renderer();
+            let Ok(mut target) = gles.bind(&mut cache.texture) else {
                 continue;
             };
-            let Ok(mut frame) = renderer.render(&mut target, win_size, Transform::Normal) else {
+            let Ok(mut frame) = gles.render(&mut target, win_size, Transform::Normal) else {
                 continue;
             };
             let _ = frame.with_context(|gl| unsafe {
@@ -1920,7 +1944,10 @@ pub(crate) fn process_blur_requests(
             cache.damage_bag.snapshot(),
             Kind::Unspecified,
         );
-        all_elements.insert(insert_idx, OutputRenderElements::Blur(blur_elem));
+        all_elements.insert(
+            insert_idx,
+            OutputRenderElements::Blur(GlesBridge(blur_elem)),
+        );
         index_shift += 1;
     }
 }

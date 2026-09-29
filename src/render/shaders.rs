@@ -9,7 +9,9 @@ use smithay::backend::renderer::{
 };
 use smithay::utils::{Logical, Physical, Point, Rectangle, Scale, Size};
 
+use super::bridge::GlesBridge;
 use super::elements::{OutputRenderElements, corner_round_rect, painted_rect};
+use super::renderer::DriftRenderer;
 
 /// Uniform declarations for background shaders. All three are optional:
 /// shaders reference only what they need; undeclared uniforms get location -1
@@ -291,8 +293,8 @@ pub(super) fn bake_border_element(
 /// * post-zoom phys key change → uniforms refreshed (geometry / scale / zoom moved)
 /// * opacity change → element reconstructed (alpha is fixed at construction time)
 #[allow(clippy::too_many_arguments)]
-pub(super) fn push_shadow_element(
-    target: &mut Vec<OutputRenderElements>,
+pub(super) fn push_shadow_element<R: DriftRenderer>(
+    target: &mut Vec<OutputRenderElements<R>>,
     cache: &mut std::collections::HashMap<
         crate::decorations::DecorationKey,
         crate::state::ShadowCacheEntry,
@@ -346,11 +348,11 @@ pub(super) fn push_shadow_element(
         elem.update_uniforms(fresh_uniforms);
     }
     elem.resize(shadow_area, None);
-    let elem = RescaleRenderElement::from_element(
+    let elem = GlesBridge(RescaleRenderElement::from_element(
         elem.clone(),
         Point::<i32, Physical>::from((0, 0)),
         zoom,
-    );
+    ));
     if let Some(animation) = animation {
         target.push(OutputRenderElements::AnimatedChrome(
             super::WindowTransformElement::new(
@@ -492,8 +494,8 @@ fn border_uniforms_precise(
 /// content rect the border wraps; the border element extends
 /// `border_width_logical` outside it on every side.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn push_border_element(
-    target: &mut Vec<OutputRenderElements>,
+pub(super) fn push_border_element<R: DriftRenderer>(
+    target: &mut Vec<OutputRenderElements<R>>,
     cache: &mut std::collections::HashMap<
         crate::decorations::DecorationKey,
         crate::state::BorderCacheEntry,
@@ -561,11 +563,11 @@ pub(super) fn push_border_element(
         elem.update_uniforms(fresh_uniforms);
     }
     elem.resize(border_area, None);
-    let elem = RescaleRenderElement::from_element(
+    let elem = GlesBridge(RescaleRenderElement::from_element(
         elem.clone(),
         Point::<i32, Physical>::from((0, 0)),
         zoom,
-    );
+    ));
     if let Some(animation) = animation {
         target.push(OutputRenderElements::AnimatedChrome(
             super::WindowTransformElement::new(

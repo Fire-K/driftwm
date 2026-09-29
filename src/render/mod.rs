@@ -1,5 +1,8 @@
+#[macro_use]
+mod render_elements_macro;
 mod background;
 mod blur;
+mod bridge;
 mod capture;
 mod capture_background;
 mod chrome;
@@ -9,6 +12,7 @@ mod elements;
 mod error_bar;
 mod layers;
 mod lifecycle;
+mod renderer;
 mod screenshot;
 mod shader_chunks;
 mod shaders;
@@ -20,7 +24,9 @@ mod tile_worker;
 pub use background::{BackgroundElement, init_background, update_background_element};
 pub(crate) use blur::compile_blur_shaders;
 pub use blur::{BlurCache, BlurScratchPool, SharedBlur};
-pub use capture::{render_capture_frames, render_screencopy, render_toplevel_captures};
+pub use capture::{
+    capture_work_pending, render_capture_frames, render_screencopy, render_toplevel_captures,
+};
 pub(crate) use closing::{
     BakeChrome, CloseChrome, ClosePixels, ClosingSnapshot, ResizeCaptures, ResizeCrossfade,
     StandInFade, capture_close_pixels, close_pixels_fresh, resize_crossfade, snapshot_canvas,
@@ -33,9 +39,10 @@ pub use elements::{
 };
 pub use error_bar::ErrorBarCache;
 pub use lifecycle::{
-    post_render, refresh_ext_workspaces, refresh_foreign_toplevels, send_frame_callbacks_fallback,
-    take_presentation_feedback, update_primary_scanout_output,
+    post_render, refresh_ext_workspaces, refresh_foreign_toplevels, send_dmabuf_feedbacks,
+    send_frame_callbacks_fallback, take_presentation_feedback, update_primary_scanout_output,
 };
+pub use renderer::{AsGlesRenderer, DriftRenderer};
 pub use screenshot::capture_region_to_png;
 pub use shader_chunks::ShaderChunkCache;
 pub use shaders::{
@@ -144,12 +151,12 @@ use driftwm::window_ext::WindowExt;
 /// over it. A lock client's `wl_pointer.set_cursor` arrives as a
 /// `CursorImageStatus` we composite ourselves, exactly as for any other
 /// client — nothing draws a cursor here but us.
-fn compose_lock_frame(
+fn compose_lock_frame<R: DriftRenderer>(
     state: &crate::state::DriftWm,
-    renderer: &mut GlesRenderer,
+    renderer: &mut R,
     output: &Output,
-    cursor_elements: Vec<OutputRenderElements>,
-) -> Vec<OutputRenderElements> {
+    cursor_elements: Vec<OutputRenderElements<R>>,
+) -> Vec<OutputRenderElements<R>> {
     // Cursor first, as in `compose_frame`, so it draws topmost.
     let mut elements = cursor_elements;
 
@@ -186,9 +193,9 @@ fn compose_lock_frame(
 /// corner that should stay square (e.g. top corners under an SSD title
 /// bar).
 #[allow(clippy::too_many_arguments)]
-fn push_corner_clipped_elements(
-    target: &mut Vec<OutputRenderElements>,
-    elems: Vec<WaylandSurfaceRenderElement<GlesRenderer>>,
+fn push_corner_clipped_elements<R: DriftRenderer>(
+    target: &mut Vec<OutputRenderElements<R>>,
+    elems: Vec<WaylandSurfaceRenderElement<R>>,
     shader: &GlesTexProgram,
     geometry: Rectangle<f64, Logical>,
     corner_radius: [f32; 4],
@@ -235,9 +242,9 @@ fn push_corner_clipped_elements(
     }
 }
 
-fn push_plain_elements(
-    target: &mut Vec<OutputRenderElements>,
-    elems: Vec<WaylandSurfaceRenderElement<GlesRenderer>>,
+fn push_plain_elements<R: DriftRenderer>(
+    target: &mut Vec<OutputRenderElements<R>>,
+    elems: Vec<WaylandSurfaceRenderElement<R>>,
     zoom: f64,
     animation: Option<WindowRenderAnimation>,
 ) {
@@ -715,12 +722,17 @@ pub(crate) fn compose_capture_elements(
 
 /// Assemble all render elements for a frame. Caller provides cursor elements
 /// (built before taking the renderer).
-pub fn compose_frame(
+pub fn compose_frame<R: DriftRenderer>(
     state: &mut crate::state::DriftWm,
-    renderer: &mut GlesRenderer,
+    renderer: &mut R,
     output: &Output,
-    cursor_elements: Vec<OutputRenderElements>,
-) -> Vec<OutputRenderElements> {
+    cursor_elements: Vec<OutputRenderElements<R>>,
+) -> Vec<OutputRenderElements<R>>
+// Carried for process_blur_requests, which re-renders elements on R. Satisfied
+// for both concrete renderers by the drift_render_elements! impls.
+where
+    OutputRenderElements<R>: smithay::backend::renderer::element::RenderElement<R>,
+{
     #[cfg(feature = "profile-with-tracy")]
     let _span = tracy_client::span!("compose_frame");
 
@@ -778,7 +790,7 @@ pub fn compose_frame(
         // on a frame the user is watching a fullscreen window in. Inherent to
         // showing the canvas through that window, not a pacing regression.
         let output_size = crate::state::output_logical_size(output);
-        init_background(state, renderer, output_size, &name);
+        init_background(state, renderer.as_gles_renderer(), output_size, &name);
         did_init_bg = true;
     }
 
@@ -823,14 +835,14 @@ pub fn compose_frame(
 
     // Split windows into normal and widget layers so canvas layers render
     // between them. Replicates render_elements_for_region internals.
-    let mut zoomed_normal: Vec<OutputRenderElements> = Vec::new();
-    let mut zoomed_widgets: Vec<OutputRenderElements> = Vec::new();
+    let mut zoomed_normal: Vec<OutputRenderElements<R>> = Vec::new();
+    let mut zoomed_widgets: Vec<OutputRenderElements<R>> = Vec::new();
     // Screen-pinned windows: own bucket, rendered above normal and below
     // Top/Overlay layer-shell (see all_elements assembly below).
-    let mut zoomed_pinned: Vec<OutputRenderElements> = Vec::new();
+    let mut zoomed_pinned: Vec<OutputRenderElements<R>> = Vec::new();
     // Closing snapshots + adoption fades: their own bucket above normal windows
     // so they never shift the normal windows' blur element indices.
-    let mut zoomed_closing: Vec<OutputRenderElements> = Vec::new();
+    let mut zoomed_closing: Vec<OutputRenderElements<R>> = Vec::new();
 
     let blur_enabled = state.render.blur_down_shader.is_some()
         && state.render.blur_up_shader.is_some()
@@ -1197,7 +1209,7 @@ pub fn compose_frame(
             let top =
                 smithay::backend::renderer::element::surface::render_elements_from_surface_tree::<
                     _,
-                    WaylandSurfaceRenderElement<GlesRenderer>,
+                    WaylandSurfaceRenderElement<R>,
                 >(
                     renderer,
                     root,
@@ -1207,19 +1219,19 @@ pub fn compose_frame(
                     Kind::Unspecified,
                 );
 
-            let mut popups: Vec<WaylandSurfaceRenderElement<GlesRenderer>> = Vec::new();
+            let mut popups: Vec<WaylandSurfaceRenderElement<R>> = Vec::new();
             for (popup, popup_offset) in smithay::desktop::PopupManager::popups_for_surface(root) {
                 let offset: Point<i32, Physical> = (window.geometry().loc + popup_offset
                     - popup.geometry().loc)
                     .to_physical_precise_round(scale);
                 popups.extend(smithay::backend::renderer::element::surface::render_elements_from_surface_tree::<
-                    _, WaylandSurfaceRenderElement<GlesRenderer>,
+                    _, WaylandSurfaceRenderElement<R>,
                 >(renderer, popup.wl_surface(), loc_phys + offset, scale, opacity as f32, Kind::Unspecified));
             }
             (top, popups)
         } else {
             // No toplevel — render the window's surface tree directly.
-            let elems = window.render_elements::<WaylandSurfaceRenderElement<GlesRenderer>>(
+            let elems = window.render_elements::<WaylandSurfaceRenderElement<R>>(
                 renderer,
                 loc_phys,
                 scale,
@@ -1746,11 +1758,11 @@ pub fn compose_frame(
         build_output_outline_elements(state, renderer, output, camera, zoom, viewport_size)
     };
 
-    let bg_elements: Vec<OutputRenderElements> = if fullscreen_conceals {
+    let bg_elements: Vec<OutputRenderElements<R>> = if fullscreen_conceals {
         vec![]
     } else if let Some(cache) = state.render.cached_shader_chunks.get_mut(&output.name()) {
         cache
-            .render_elements(visible_rect, renderer, camera, zoom)
+            .render_elements(visible_rect, renderer.as_gles_renderer(), camera, zoom)
             .into_iter()
             .map(OutputRenderElements::TileBgChunk)
             .collect()
@@ -1760,7 +1772,7 @@ pub fn compose_frame(
         // sub-ms on M1, ~2-3ms on weak iGPUs — 8 keeps upload under ~25ms on
         // the slow path and drains a worker burst in one frame on fast
         // hardware. Coarser-LOD overlays + fallback plane cover undrained.
-        cache.ensure_visible_loaded(visible_rect, renderer, zoom, 8);
+        cache.ensure_visible_loaded(visible_rect, renderer.as_gles_renderer(), zoom, 8);
         tile_chunks::chunk_render_elements(cache, visible_rect, camera, zoom)
             .into_iter()
             .map(OutputRenderElements::TileBgChunk)
@@ -1813,7 +1825,7 @@ pub fn compose_frame(
     all_blur_requests.extend(top_blur);
     all_blur_requests.extend(blur_requests);
 
-    let mut all_elements: Vec<OutputRenderElements> = Vec::with_capacity(
+    let mut all_elements: Vec<OutputRenderElements<R>> = Vec::with_capacity(
         cursor_elements.len()
             + overlay_elements.len()
             + top_elements.len()
@@ -1964,14 +1976,14 @@ fn outline_buffer(
 }
 
 /// Thin outlines showing where other monitors' viewports sit on the canvas.
-fn build_output_outline_elements(
+fn build_output_outline_elements<R: DriftRenderer>(
     state: &mut crate::state::DriftWm,
-    renderer: &mut GlesRenderer,
+    renderer: &mut R,
     output: &Output,
     camera: Point<f64, Logical>,
     zoom: f64,
     viewport_size: Size<i32, Logical>,
-) -> Vec<OutputRenderElements> {
+) -> Vec<OutputRenderElements<R>> {
     let thickness = state.config.output_outline.thickness;
     let opacity = state.config.output_outline.opacity as f32;
     if thickness <= 0 || opacity <= 0.0 {
