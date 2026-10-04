@@ -382,6 +382,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         smithay::reexports::calloop::timer::Timer::from_duration(std::time::Duration::from_secs(1)),
         |_, _, data: &mut DriftWm| {
             crate::render::send_frame_callbacks_fallback(data);
+            crate::xwayland::respawn_if_dead(data);
             smithay::reexports::calloop::timer::TimeoutAction::ToDuration(
                 std::time::Duration::from_secs(1),
             )

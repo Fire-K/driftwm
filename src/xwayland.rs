@@ -102,6 +102,29 @@ pub fn setup(state: &mut DriftWm) {
     state.satellite = Some(Satellite { child });
 }
 
+/// Check whether the satellite child is still alive and, if it has exited
+/// (crash or otherwise), clear the stale handle and spawn a fresh one so X11
+/// apps recover instead of staying dead for the rest of the session.
+///
+/// SIGCHLD is process-wide `SIG_IGN` (see `main`), so the kernel auto-reaps
+/// the child before driftwm ever sees its exit — `Child::try_wait` would just
+/// see `ECHILD` for a child that's already gone. Liveness is probed directly
+/// with a signal-0 kill instead, which works regardless of reaping.
+pub fn respawn_if_dead(state: &mut DriftWm) {
+    let Some(satellite) = state.satellite.as_ref() else {
+        return;
+    };
+    let Some(pid) = rustix::process::Pid::from_raw(satellite.child.id() as i32) else {
+        return;
+    };
+    if rustix::process::test_kill_process(pid).is_ok() {
+        return;
+    }
+    tracing::warn!("xwayland-satellite (pid={pid:?}) is gone — respawning");
+    state.satellite = None;
+    setup(state);
+}
+
 /// Probe whether the binary at `path` is launchable and supports our
 /// expected protocol. Uses `--test-listenfd-support` because it's a cheap
 /// "binary exists and responds to argv" check that all satellites since 0.7
