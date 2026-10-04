@@ -33,6 +33,7 @@ use smithay::{
     reexports::{
         calloop::{
             Dispatcher, EventLoop, RegistrationToken,
+            channel::{Event as ChannelEvent, Sender, channel},
             timer::{TimeoutAction, Timer},
         },
         drm::control::{self, connector, crtc},
@@ -99,6 +100,22 @@ pub struct UdevRenderer {
     /// (i.e. with an output attached). Empty in the common single-GPU and idle
     /// dGPU cases.
     pub secondary_render_nodes: HashSet<DrmNode>,
+    /// KMS nodes of secondary GPUs whose GBM/EGL bring-up is running on a
+    /// background thread (see `scan_device_connectors`). Guards against
+    /// spawning a second probe for a device that is still waking up.
+    gfx_probes_in_flight: HashSet<DrmNode>,
+    /// Sends a finished background bring-up back to the main thread; cloned
+    /// into each probe thread.
+    gfx_probe_sender: Sender<GfxProbeResult>,
+}
+
+/// Result of a secondary GPU's GBM/EGL bring-up, run off the main thread so a
+/// dGPU waking from runtime suspend (power-up + possible firmware reload)
+/// never blocks rendering or input on other outputs. `None` means the probe
+/// failed (logged on the worker thread already).
+struct GfxProbeResult {
+    node: DrmNode,
+    gfx: Option<DeviceGfx>,
 }
 
 struct DeviceData {
@@ -702,10 +719,13 @@ pub fn init_udev(
     let primary_render_formats = primary_gfx.render_formats.clone();
 
     // 4. Store renderer on state + create DMA-BUF global
+    let (gfx_probe_sender, gfx_probe_channel) = channel::<GfxProbeResult>();
     data.backend = Some(Backend::Udev(Box::new(UdevRenderer {
         gpu_manager,
         primary_render_node,
         secondary_render_nodes: HashSet::new(),
+        gfx_probes_in_flight: HashSet::new(),
+        gfx_probe_sender,
     })));
     let formats = data
         .backend
@@ -864,6 +884,39 @@ pub fn init_udev(
             }
         })?;
 
+    // 6b. Register the secondary-GPU bring-up channel: a probe thread
+    // spawned from `scan_device_connectors` sends its result here, off the
+    // single event-loop thread it must never block.
+    event_loop
+        .handle()
+        .insert_source(gfx_probe_channel, move |event, _, data: &mut DriftWm| {
+            let ChannelEvent::Msg(GfxProbeResult { node, gfx }) = event else {
+                return;
+            };
+            let Some(Backend::Udev(udev)) = data.backend.as_mut() else {
+                return;
+            };
+            udev.gfx_probes_in_flight.remove(&node);
+            let Some(device) = data.udev_devices.get(&node).cloned() else {
+                tracing::debug!("gfx probe finished for a now-removed device {node}");
+                return;
+            };
+            if let Some(probed) = gfx {
+                let Some(Backend::Udev(udev)) = data.backend.as_mut() else {
+                    return;
+                };
+                if let Some(ready) = register_gfx(&mut udev.gpu_manager, node, probed) {
+                    if ready.render_node != udev.primary_render_node {
+                        udev.secondary_render_nodes.insert(ready.render_node);
+                    }
+                    device.0.borrow_mut().gfx = Some(ready);
+                }
+            }
+            // Picks the now-ready (or still-failed, logged already) gfx back
+            // up immediately instead of waiting for the next retry tick.
+            scan_device_connectors(data, &device);
+        })?;
+
     // 7. Register udev backend for hotplug (connectors AND whole GPUs)
     let udev_dispatcher = Dispatcher::new(
         udev_backend,
@@ -979,6 +1032,18 @@ fn init_gfx(
     node: DrmNode,
     drm_fd: &DrmDeviceFd,
 ) -> Option<DeviceGfx> {
+    let gbm = probe_gfx(node, drm_fd)?;
+    register_gfx(gpu_manager, node, gbm)
+}
+
+/// The slow half of GPU bring-up: open GBM, create an EGL display/context and
+/// resolve the render node and formats. Touches only the DRM fd and freshly
+/// created EGL/GBM objects — no shared compositor state — so it's safe to run
+/// on a background thread. For a dGPU waking from PCI runtime suspend this is
+/// where the time goes (power-up, and on NVIDIA a GSP firmware reload), which
+/// is why `scan_device_connectors` runs it off the main thread instead of
+/// blocking rendering/input on every other output while it waits.
+fn probe_gfx(node: DrmNode, drm_fd: &DrmDeviceFd) -> Option<DeviceGfx> {
     let gbm = match GbmDevice::new(drm_fd.clone()) {
         Ok(g) => g,
         Err(e) => {
@@ -1059,28 +1124,46 @@ fn init_gfx(
     // Drop the probe context before handing the GBM device to the GPU
     // manager, which creates its own EGL display + GLES renderer for the
     // render node (avoids two high-priority contexts on the same device).
-    // add_node is a no-op if another KMS device already registered this
-    // render node (split-DRM boards routing through one render GPU).
     drop(egl_context);
-    if let Err(e) = gpu_manager.as_mut().add_node(render_node, gbm.clone()) {
-        tracing::warn!("{node}: failed to add render node to GPU manager ({e})");
-        return None;
-    }
-    // add_node only records the node; the GLES renderer is built on first use
-    // and a failure there is otherwise silent. Build it now so a broken
-    // secondary GPU is rejected here instead of retried on every frame.
-    if let Err(e) = gpu_manager.single_renderer(&render_node) {
-        tracing::warn!("{node}: GLES renderer unavailable on {render_node} ({e:?})");
-        gpu_manager.as_mut().remove_node(&render_node);
-        let _ = gpu_manager.devices();
-        return None;
-    }
 
     Some(DeviceGfx {
         gbm,
         render_node,
         render_formats,
     })
+}
+
+/// Register an already-probed GBM device's render node with the GPU manager
+/// (its own EGL display + GLES renderer). Cheap once the GPU is actually
+/// awake — the slow part already happened in `probe_gfx` — so this stays on
+/// the main thread. `add_node` is a no-op if another KMS device already
+/// registered this render node (split-DRM boards routing through one render
+/// GPU). Returns `None` (with a log line) on failure.
+fn register_gfx(
+    gpu_manager: &mut GpuManager<GbmGlesBackend<GlesRenderer, DrmDeviceFd>>,
+    node: DrmNode,
+    gfx: DeviceGfx,
+) -> Option<DeviceGfx> {
+    if let Err(e) = gpu_manager
+        .as_mut()
+        .add_node(gfx.render_node, gfx.gbm.clone())
+    {
+        tracing::warn!("{node}: failed to add render node to GPU manager ({e})");
+        return None;
+    }
+    // add_node only records the node; the GLES renderer is built on first use
+    // and a failure there is otherwise silent. Build it now so a broken
+    // secondary GPU is rejected here instead of retried on every frame.
+    if let Err(e) = gpu_manager.single_renderer(&gfx.render_node) {
+        tracing::warn!(
+            "{node}: GLES renderer unavailable on {} ({e:?})",
+            gfx.render_node
+        );
+        gpu_manager.as_mut().remove_node(&gfx.render_node);
+        let _ = gpu_manager.devices();
+        return None;
+    }
+    Some(gfx)
 }
 
 /// Wire an opened GPU into the compositor: register its VBlank event source,
@@ -1205,12 +1288,27 @@ fn scan_device_connectors(data: &mut DriftWm, device: &UdevDevice) {
                         let Some(Backend::Udev(udev)) = data.backend.as_mut() else {
                             continue;
                         };
-                        *gfx = init_gfx(&mut udev.gpu_manager, kms_node, drm_fd);
-                        if let Some(g) = gfx.as_ref()
-                            && g.render_node != udev.primary_render_node
-                        {
-                            udev.secondary_render_nodes.insert(g.render_node);
+                        if !udev.gfx_probes_in_flight.contains(&kms_node) {
+                            udev.gfx_probes_in_flight.insert(kms_node);
+                            let sender = udev.gfx_probe_sender.clone();
+                            let probe_drm_fd = drm_fd.clone();
+                            std::thread::spawn(move || {
+                                let gfx = probe_gfx(kms_node, &probe_drm_fd);
+                                let _ = sender.send(GfxProbeResult {
+                                    node: kms_node,
+                                    gfx,
+                                });
+                            });
                         }
+                        // Bring-up (GBM/EGL, and on a dGPU waking from runtime
+                        // suspend possibly a firmware reload) runs on that
+                        // worker thread so it never blocks the single event
+                        // loop thread that also draws every other output and
+                        // reads input. The channel handler re-scans as soon
+                        // as the probe finishes; the retry timer below is
+                        // just a safety net.
+                        retry = true;
+                        continue;
                     }
                     let Some(DeviceGfx {
                         gbm,
@@ -1287,6 +1385,7 @@ fn scan_device_connectors(data: &mut DriftWm, device: &UdevDevice) {
             }
         }
         if surfaces.is_empty()
+            && !data.config.backend.keep_secondary_gpu_awake
             && let Some(released) = gfx.as_ref().map(|g| g.render_node)
             && let Some(Backend::Udev(udev)) = data.backend.as_mut()
             && released != udev.primary_render_node

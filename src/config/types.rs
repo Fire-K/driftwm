@@ -1052,6 +1052,14 @@ pub enum GpuScope {
 pub struct BackendConfig {
     pub render_gpu: RenderGpu,
     pub gpus: GpuScope,
+    /// Keep a secondary GPU's GBM/EGL context alive even after its last
+    /// output disconnects, instead of releasing it so the GPU can hit PCI
+    /// runtime suspend. Trades the idle GPU's power/CPU draw for an instant
+    /// wake: with this off (default), waking a fully-suspended dGPU (power-up,
+    /// on NVIDIA possibly a GSP firmware reload) runs on a background thread
+    /// so it no longer blocks other outputs — but it still takes real time
+    /// before that GPU's own output lights up.
+    pub keep_secondary_gpu_awake: bool,
     pub wait_for_frame_completion: bool,
     pub disable_direct_scanout: bool,
     pub disable_hardware_cursor: bool,

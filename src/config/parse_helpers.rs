@@ -566,6 +566,7 @@ pub(super) fn parse_backend_config(raw: BackendFileConfig, errors: &mut Warnings
     BackendConfig {
         render_gpu,
         gpus,
+        keep_secondary_gpu_awake: raw.keep_secondary_gpu_awake.unwrap_or(false),
         wait_for_frame_completion: raw.wait_for_frame_completion.unwrap_or(false),
         disable_direct_scanout: raw.disable_direct_scanout.unwrap_or(false),
         disable_hardware_cursor: raw.disable_hardware_cursor.unwrap_or(false),

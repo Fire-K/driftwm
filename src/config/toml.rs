@@ -46,6 +46,7 @@ pub(super) struct BindingsFileConfig {
 pub(super) struct BackendFileConfig {
     pub render_gpu: Option<String>,
     pub gpus: Option<String>,
+    pub keep_secondary_gpu_awake: Option<bool>,
     pub wait_for_frame_completion: Option<bool>,
     pub disable_direct_scanout: Option<bool>,
     pub disable_hardware_cursor: Option<bool>,

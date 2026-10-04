@@ -1188,6 +1188,12 @@ Default: `"all"`
 
 "all": drive monitors on every GPU (external monitor on the discrete GPU's HDMI works). "render": drive only the render GPU's monitors and never open the others — use for integrated-only or discrete-only.
 
+### `keep_secondary_gpu_awake`
+
+Default: `false`
+
+Keep a secondary GPU's GBM/EGL context alive even after its last output disconnects, instead of releasing it so the GPU can hit PCI runtime suspend. Default false saves idle power but means waking a fully-suspended dGPU (power-up, on NVIDIA possibly a firmware reload) takes real time before its own output lights up again — e.g. after laptop suspend with a monitor wired to the dGPU. That wait no longer blocks other outputs or input either way (it runs off the main thread); set this true to skip the wait entirely at the cost of extra idle GPU power/CPU.
+
 ### `wait_for_frame_completion`
 
 Default: `false`
